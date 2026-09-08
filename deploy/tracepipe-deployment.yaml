@@ -69,7 +69,7 @@ spec:
       containers:
         - name: tracepipe
           # 打 v* tag 由 CI 推到 GHCR，见 README「发布」
-          image: ghcr.io/easayliu/trace:v0.1.1
+          image: ghcr.io/easayliu/trace:v0.2.0
           args: ["/etc/tracepipe/tracepipe.yaml"]
           env:
             - name: RUST_LOG

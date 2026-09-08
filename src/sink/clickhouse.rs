@@ -29,48 +29,34 @@ const COLUMNS_HEAD: [(&str, &str); 14] = [
     ("status_message", "String"),
     ("scope_name", "LowCardinality(String)"),
     ("scope_version", "LowCardinality(String)"),
-    ("resource_attributes", "Map(LowCardinality(String), String)"),
-    ("span_attributes", "Map(LowCardinality(String), String)"),
+    ("resource_attributes", "JSON"),
+    ("span_attributes", "JSON"),
 ];
 
 /// `events.timestamp` 之后的固定列。events / links 用 `Nested` 的平铺写法：几个等长
 /// 数组，列名带点。
 const COLUMNS_TAIL: [(&str, &str); 6] = [
     ("events.name", "Array(LowCardinality(String))"),
-    (
-        "events.attributes",
-        "Array(Map(LowCardinality(String), String))",
-    ),
+    ("events.attributes", "Array(JSON)"),
     ("links.trace_id", "Array(String)"),
     ("links.span_id", "Array(String)"),
     ("links.trace_state", "Array(String)"),
-    (
-        "links.attributes",
-        "Array(Map(LowCardinality(String), String))",
-    ),
+    ("links.attributes", "Array(JSON)"),
 ];
 
+/// 属性列的类型。`JSON` 列里每个 key 是一个独立的子列，查 `span_attributes.http.route`
+/// 只读这一个子列，不用把整行属性解出来；值保留 OTLP 里的类型。需要 ClickHouse 25.3+
+/// （JSON 类型在 25.3 转正）。healthcheck 也用它认老表：Map 类型的老表不能直接写。
+pub const ATTRIBUTES_TYPE: &str = "JSON";
+
 /// 跳数索引。按 trace id 反查（Jaeger / 日志表拿到一个 id 过来）不带时间范围，排序键
-/// 帮不上忙，bloom filter 让这种查询跳过绝大多数 granule；属性的 key / value 索引是
-/// 「找带某个 tag 的 span」用的，和 OTel exporter 建的一样。
-const INDEXES: [(&str, &str); 6] = [
+/// 帮不上忙，bloom filter 让这种查询跳过绝大多数 granule。
+///
+/// 属性上不预建索引：`JSON` 列的跳数索引要建在带类型的子列上（比如
+/// `span_attributes.http.route.:String`），哪些 key 值得建索引由查询决定，在 DDL 输出
+/// 之外自己 `ADD INDEX`，README 有例子。
+const INDEXES: [(&str, &str); 2] = [
     ("idx_trace_id", "`trace_id` TYPE bloom_filter GRANULARITY 4"),
-    (
-        "idx_res_attr_key",
-        "mapKeys(`resource_attributes`) TYPE bloom_filter(0.01) GRANULARITY 1",
-    ),
-    (
-        "idx_res_attr_value",
-        "mapValues(`resource_attributes`) TYPE bloom_filter(0.01) GRANULARITY 1",
-    ),
-    (
-        "idx_span_attr_key",
-        "mapKeys(`span_attributes`) TYPE bloom_filter(0.01) GRANULARITY 1",
-    ),
-    (
-        "idx_span_attr_value",
-        "mapValues(`span_attributes`) TYPE bloom_filter(0.01) GRANULARITY 1",
-    ),
     ("idx_duration", "`duration_ns` TYPE minmax GRANULARITY 1"),
 ];
 
@@ -372,6 +358,31 @@ impl ClickhouseSink {
     }
 }
 
+/// 四个属性列，healthcheck 校验类型用。
+const ATTRIBUTE_COLUMNS: [&str; 4] = [
+    "resource_attributes",
+    "span_attributes",
+    "events.attributes",
+    "links.attributes",
+];
+
+/// `system.columns` 里的类型是不是期望的 JSON 类型。带参数的写法
+/// （`JSON(max_dynamic_paths=2048)`、`Array(JSON(...))`）也算：参数是人按需要调的。
+fn is_json_type(actual: &str, expected: &str) -> bool {
+    let actual = actual.replace(' ', "");
+    let expected = expected.replace(' ', "");
+    if actual == expected {
+        return true;
+    }
+    match expected.strip_prefix("Array(") {
+        Some(inner) => actual
+            .strip_prefix("Array(")
+            .and_then(|a| a.strip_suffix(')'))
+            .is_some_and(|a| is_json_type(a, inner.trim_end_matches(')'))),
+        None => actual.starts_with("JSON(") && actual.ends_with(')'),
+    }
+}
+
 /// SQL 字符串字面量转义：库名表名来自配置，反引号标识符走的是另一套规则，这里只管
 /// `WHERE database = '...'` 里的单引号串。
 fn escape_literal(raw: &str) -> String {
@@ -439,20 +450,24 @@ impl Sink for ClickhouseSink {
         // 字段不报错、整批也不失败，只是那个字段悄悄没了。启动时对一遍，缺了直接说清楚。
         let present = self
             .execute(&format!(
-                "SELECT name FROM system.columns WHERE database = '{}' AND table = '{}' FORMAT TSV",
+                "SELECT name, type FROM system.columns WHERE database = '{}' AND table = '{}' FORMAT TSV",
                 escape_literal(&self.database),
                 escape_literal(&self.table)
             ))
             .await?;
-        let present: std::collections::HashSet<&str> = present
+        let present: std::collections::HashMap<&str, &str> = present
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
+            .map(|line| match line.split_once('\t') {
+                Some((name, ty)) => (name, ty.trim()),
+                None => (line, ""),
+            })
             .collect();
         let missing: Vec<String> = self
             .expected_columns()
             .into_iter()
-            .filter(|name| !present.contains(name.as_str()))
+            .filter(|name| !present.contains_key(name.as_str()))
             .collect();
         if !missing.is_empty() {
             return Err(Error::Sink(
@@ -462,6 +477,34 @@ impl Sink for ClickhouseSink {
                     self.database,
                     self.table,
                     missing.join(", ")
+                )
+                .into(),
+            ));
+        }
+
+        // v0.1 的表属性列是 Map(String, String)。`ADD COLUMN IF NOT EXISTS` 见列名已存在
+        // 会跳过，DDL 补不了类型；往 Map 列里插 JSON 对象倒是能成功（值会被转成字符串），
+        // 但查询写法完全不同，所以这里当成错误，让人明确处理一次。
+        let wrong_type: Vec<String> = ATTRIBUTE_COLUMNS
+            .iter()
+            .filter_map(|name| {
+                let ty = present.get(name)?;
+                let expected = if name.starts_with("events.") || name.starts_with("links.") {
+                    format!("Array({ATTRIBUTES_TYPE})")
+                } else {
+                    ATTRIBUTES_TYPE.to_owned()
+                };
+                (!ty.is_empty() && !is_json_type(ty, &expected)).then(|| format!("{name} 是 {ty}"))
+            })
+            .collect();
+        if !wrong_type.is_empty() {
+            return Err(Error::Sink(
+                format!(
+                    "表 {}.{} 的属性列不是 JSON 类型（{}）：这是 v0.1 建的 Map 表。\
+                     DROP（或 RENAME 保留老数据）之后重跑 `tracepipe --ddl` 建新表",
+                    self.database,
+                    self.table,
+                    wrong_type.join("、")
                 )
                 .into(),
             ));
@@ -494,6 +537,10 @@ mod tests {
             ddl.contains("`events.timestamp`    Array(DateTime64(9)),"),
             "{ddl}"
         );
+        assert!(ddl.contains("`span_attributes`     JSON,"), "{ddl}");
+        assert!(ddl.contains("`events.attributes`   Array(JSON),"), "{ddl}");
+        assert!(!ddl.contains("Map("), "属性列不再是 Map: {ddl}");
+        assert!(!ddl.contains("mapKeys"), "Map 上的索引要一起去掉: {ddl}");
         for (name, _) in COLUMNS_HEAD.iter().chain(COLUMNS_TAIL.iter()) {
             assert!(
                 ddl.contains(&format!("`{name}`")),
@@ -519,6 +566,26 @@ mod tests {
         assert!(!ddl.contains("MODIFY COLUMN"), "没配时区别去动列: {ddl}");
         // main 会在末尾补分号，这里不能自带
         assert!(!ddl.trim_end().ends_with(';'), "{ddl}");
+    }
+
+    #[test]
+    fn json_type_check_accepts_parameters_and_rejects_map() {
+        assert!(is_json_type("JSON", "JSON"));
+        assert!(is_json_type("JSON(max_dynamic_paths=2048)", "JSON"));
+        assert!(is_json_type(
+            "JSON(max_dynamic_paths = 2048, max_dynamic_types = 16)",
+            "JSON"
+        ));
+        assert!(is_json_type("Array(JSON)", "Array(JSON)"));
+        assert!(is_json_type(
+            "Array(JSON(max_dynamic_paths=64))",
+            "Array(JSON)"
+        ));
+        assert!(!is_json_type("Map(LowCardinality(String), String)", "JSON"));
+        assert!(!is_json_type("Array(Map(String, String))", "Array(JSON)"));
+        assert!(!is_json_type("JSON", "Array(JSON)"));
+        assert!(!is_json_type("Array(JSON)", "JSON"));
+        assert!(!is_json_type("String", "JSON"));
     }
 
     #[test]

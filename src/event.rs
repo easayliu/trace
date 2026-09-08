@@ -18,9 +18,9 @@ use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-/// 属性统一存成字符串：ClickHouse 那边是 `Map(String, String)`，和 OTel collector 的
-/// clickhouse exporter 口径一致。数字、布尔按字面量转；数组和嵌套对象转成 JSON 串。
-pub type Attributes = BTreeMap<String, String>;
+/// 属性保留 OTLP 里的类型：ClickHouse 那边是 `JSON` 列，每个 key 是一个带类型的子列。
+/// 字符串、整数、小数、布尔原样；bytes 转 base64 串；数组和嵌套对象就是 JSON 数组 / 对象。
+pub type Attributes = BTreeMap<String, Value>;
 
 /// OTLP 的 `SpanKind`。存的名字沿用 OTel collector clickhouse exporter 的写法
 /// （`Server` / `Client` ……），现成的 Grafana 面板和查询能直接套。
@@ -156,18 +156,17 @@ impl SpanEvent {
     }
 
     /// 先查 span 属性，再查 resource 属性。
-    pub fn attribute(&self, key: &str) -> Option<&str> {
+    pub fn attribute(&self, key: &str) -> Option<&Value> {
         self.span_attributes
             .get(key)
             .or_else(|| self.resource_attributes.get(key))
-            .map(String::as_str)
     }
 
     /// 估算编码成 JSON 后的字节数，用于按体积攒批。
     pub fn estimated_size(&self) -> usize {
         fn attrs(map: &Attributes) -> usize {
             map.iter()
-                .map(|(k, v)| k.len() + v.len() + 6)
+                .map(|(k, v)| k.len() + estimated_value_size(v) + 4)
                 .sum::<usize>()
                 + 2
         }
@@ -456,7 +455,7 @@ mod tests {
                 name: "exception".into(),
                 attributes: [(
                     "exception.type".to_owned(),
-                    "IllegalStateException".to_owned(),
+                    Value::from("IllegalStateException"),
                 )]
                 .into_iter()
                 .collect(),

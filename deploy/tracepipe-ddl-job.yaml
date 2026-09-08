@@ -22,7 +22,7 @@ spec:
       initContainers:
         - name: render-ddl
           # 和 Deployment 用同一个 tag，否则可能渲染出跟采集端不一致的列
-          image: ghcr.io/easayliu/trace:v0.1.1
+          image: ghcr.io/easayliu/trace:v0.2.0
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -38,8 +38,8 @@ spec:
               mountPath: /shared
       containers:
         - name: apply-ddl
-          # 建议换成你们集群自己的 CK 版本镜像
-          image: clickhouse/clickhouse-server:24.8
+          # 建议换成你们集群自己的 CK 版本镜像。属性列是 JSON 类型，服务端要 25.3+
+          image: clickhouse/clickhouse-server:25.3
           command: ["/bin/sh", "-c"]
           args:
             - |

@@ -148,10 +148,13 @@ fn assert_sample(events: &[SpanEvent]) {
     assert_eq!(server.timestamp, START);
     assert_eq!(server.duration_ns, 12_345_678);
     assert_eq!(&*server.scope_name, "io.opentelemetry.tomcat-10.0");
-    assert_eq!(server.attribute("http.response.status_code"), Some("500"));
+    assert_eq!(
+        server.attribute("http.response.status_code"),
+        Some(&serde_json::json!(500))
+    );
     assert_eq!(
         server.attribute("k8s.pod.name"),
-        Some("order-service-7d9f8b6c4-abcde")
+        Some(&serde_json::json!("order-service-7d9f8b6c4-abcde"))
     );
     assert_eq!(server.events.len(), 1);
     assert_eq!(server.events[0].name, "exception");

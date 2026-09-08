@@ -42,7 +42,7 @@ pub fn convert(
         let service_name: Arc<str> = Arc::from(
             resource_attributes
                 .get("service.name")
-                .map(String::as_str)
+                .and_then(Json::as_str)
                 .filter(|s| !s.is_empty())
                 .unwrap_or(UNKNOWN_SERVICE),
         );
@@ -143,20 +143,11 @@ pub fn attributes(list: Vec<KeyValue>) -> Attributes {
         .collect()
 }
 
-/// `AnyValue` 的字符串形式，和 OTel collector 里 `pcommon.Value.AsString()` 的口径一致：
-/// 字符串原样，数字 / 布尔按字面量，bytes 转 base64，数组和嵌套对象转成 JSON 串。
-pub fn attribute_value(value: Option<AnyValue>) -> String {
-    match value.and_then(|v| v.value) {
-        None => String::new(),
-        Some(Any::StringValue(s)) => s,
-        Some(Any::BoolValue(b)) => b.to_string(),
-        Some(Any::IntValue(i)) => i.to_string(),
-        Some(Any::DoubleValue(d)) => d.to_string(),
-        Some(Any::BytesValue(b)) => base64::engine::general_purpose::STANDARD.encode(b),
-        Some(nested @ (Any::ArrayValue(_) | Any::KvlistValue(_))) => to_json(nested).to_string(),
-        // 只在 profiling 信号里出现，trace 里遇到按 OTLP 的说法当空值处理
-        Some(Any::StringValueStrindex(_)) => String::new(),
-    }
+/// `AnyValue` → JSON，类型原样保留，落到 ClickHouse 的 `JSON` 列里每个 key 就是带类型的
+/// 子列：字符串、整数、小数、布尔照搬；bytes 转 base64 串；数组、嵌套对象就是 JSON 数组 /
+/// 对象。没有值的属性记 `null`。
+pub fn attribute_value(value: Option<AnyValue>) -> Json {
+    value.and_then(|v| v.value).map_or(Json::Null, to_json)
 }
 
 fn to_json(value: Any) -> Json {
@@ -164,6 +155,7 @@ fn to_json(value: Any) -> Json {
         Any::StringValue(s) => Json::from(s),
         Any::BoolValue(b) => Json::from(b),
         Any::IntValue(i) => Json::from(i),
+        // NaN / Inf 在 JSON 里没有写法，记 null
         Any::DoubleValue(d) => serde_json::Number::from_f64(d).map_or(Json::Null, Json::Number),
         Any::BytesValue(b) => Json::from(base64::engine::general_purpose::STANDARD.encode(b)),
         Any::ArrayValue(array) => Json::Array(
@@ -184,6 +176,7 @@ fn to_json(value: Any) -> Json {
                 })
                 .collect(),
         ),
+        // 只在 profiling 信号里出现，trace 里遇到按 OTLP 的说法当空值处理
         Any::StringValueStrindex(_) => Json::Null,
     }
 }
@@ -215,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn attribute_values_follow_collector_conventions() {
+    fn attribute_values_keep_their_types() {
         let attrs = attributes(vec![
             kv("s", Any::StringValue("x".into())),
             kv("b", Any::BoolValue(true)),
@@ -247,14 +240,20 @@ mod tests {
                 ..Default::default()
             },
         ]);
-        assert_eq!(attrs["s"], "x");
-        assert_eq!(attrs["b"], "true");
-        assert_eq!(attrs["i"], "-7");
-        assert_eq!(attrs["d"], "1.5");
-        assert_eq!(attrs["bytes"], "3q0=");
-        assert_eq!(attrs["arr"], r#"[1,"two"]"#);
-        assert_eq!(attrs["obj"], r#"{"k":false}"#);
-        assert_eq!(attrs["empty"], "");
+        assert_eq!(attrs["s"], Json::from("x"));
+        assert_eq!(attrs["b"], Json::from(true));
+        assert_eq!(attrs["i"], Json::from(-7));
+        assert_eq!(attrs["d"], Json::from(1.5));
+        assert_eq!(attrs["bytes"], Json::from("3q0="));
+        assert_eq!(attrs["arr"], serde_json::json!([1, "two"]));
+        assert_eq!(attrs["obj"], serde_json::json!({"k": false}));
+        assert_eq!(attrs["empty"], Json::Null);
+        assert_eq!(
+            attribute_value(Some(AnyValue {
+                value: Some(Any::DoubleValue(f64::NAN))
+            })),
+            Json::Null
+        );
     }
 
     #[test]
@@ -277,8 +276,15 @@ mod tests {
         assert_eq!(span.status_message, "boom");
         assert_eq!(span.timestamp, 1_789_000_000_000_000_000);
         assert_eq!(span.duration_ns, 12_345_678);
-        assert_eq!(span.attribute("http.response.status_code"), Some("500"));
-        assert_eq!(span.attribute("service.name"), Some("order-service"));
+        // intValue 落库后仍是整数，不是 "500"
+        assert_eq!(
+            span.attribute("http.response.status_code"),
+            Some(&Json::from(500))
+        );
+        assert_eq!(
+            span.attribute("service.name"),
+            Some(&Json::from("order-service"))
+        );
     }
 
     #[test]

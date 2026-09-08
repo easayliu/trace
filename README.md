@@ -34,14 +34,67 @@ resource / scope 的信息复制到每一行上。列的布局参考 OTel collec
 | `duration_ns` | `end - start` | 纳秒；时钟回拨造成 end < start 时记 0 |
 | `status_code` / `status_message` | `status` | `Unset` / `Ok` / `Error` |
 | `scope_name` / `scope_version` | scope | 比如 `io.opentelemetry.tomcat-10.0` / `2.9.0` |
-| `resource_attributes` | resource | `Map(String, String)` |
-| `span_attributes` | span | `Map(String, String)` |
+| `resource_attributes` | resource | `JSON`，每个 key 一个带类型的子列，见下面「属性列」 |
+| `span_attributes` | span | `JSON` |
 | `events.*` | span events | `Nested`：`timestamp` / `name` / `attributes` 三个等长数组，异常栈在这里 |
 | `links.*` | span links | `Nested`：`trace_id` / `span_id` / `trace_state` / `attributes` |
 
-属性统一存成字符串（和 exporter 一样）：数字、布尔按字面量，bytes 转 base64，数组和嵌套对象转成
-JSON 串。`span_kind` / `status_code` 的取值沿用 exporter 的写法，给 `otel_traces` 写的 Grafana
-面板和查询改个列名就能套。
+属性保留 OTLP 里的类型：字符串、整数、小数、布尔原样，bytes 转 base64 串，数组和嵌套对象就是
+JSON 数组 / 对象，没有值的属性记 `null`。`span_kind` / `status_code` 的取值沿用 exporter 的写法，
+给 `otel_traces` 写的 Grafana 面板和查询改个列名就能套。
+
+### 属性列
+
+四个属性列（`resource_attributes` / `span_attributes` / `events.attributes` / `links.attributes`）
+是 ClickHouse 的 `JSON` 类型，**需要 ClickHouse 25.3+**（JSON 类型在 25.3 转正）。v0.1 用的是
+`Map(String, String)`，换成 JSON 的原因：Map 查一个 key 要把整个 map 列解压出来再取值，属性多的
+span 一行几 KB，扫一小时就是几十 GB 的解压；JSON 列里每个 key 是独立的子列，查
+`span_attributes.http.route` 只读这一个子列，而且值带类型，`status_code` 就是整数。
+
+写法要点：
+
+* **key 里的点就是路径分隔**：`http.response.status_code` 存成 `http` → `response` → `status_code`，
+  查询写 `span_attributes.http.response.status_code`，查出来整列显示也是嵌套的。这是 ClickHouse
+  JSON 类型的规则，和 OTel exporter 的 JSON 表一样。
+* **同一个 key 类型不一致时按类型取**：Java agent 给 `http.response.status_code` 发整数，某个自己
+  埋点的服务发字符串 `"200"`，直接 `= 500` 会报 `NO_COMMON_TYPE`。写
+  `span_attributes.http.response.status_code.:Int64 = 500` 只取整数那部分（字符串的行当 NULL），
+  或者 `toString(...) = '500'` 两边都要。
+* **跳数索引建在带类型的子列上**：`--ddl` 不预建属性索引（Map 时代的 `mapKeys` / `mapValues`
+  bloom filter 没有了），哪些 key 值得建由查询决定，自己加：
+
+  ```sql
+  ALTER TABLE logs.otel_trace
+      ADD INDEX idx_http_route span_attributes.http.route.:String TYPE bloom_filter(0.01) GRANULARITY 1,
+      ADD INDEX idx_http_status span_attributes.http.response.status_code.:Int64 TYPE minmax GRANULARITY 1;
+  ```
+
+  直接在 `span_attributes.http.route` 上建会被拒（`Unexpected type Dynamic of bloom filter index`），
+  必须带 `.:类型`。历史 part 要 `MATERIALIZE INDEX` 才有。
+* **路径数上限**：JSON 列默认最多 1024 个不同路径，超过的进「共享数据」区，还能查但退化成整列
+  解析。span 属性 key 是 SDK 语义约定的，一般几百个；确认要更多就改 `--ddl` 输出里的类型：
+  `` `span_attributes` JSON(max_dynamic_paths = 4096) ``，healthcheck 认带参数的写法。别把用户
+  id 这种无限多的值当 key 用。
+* **要 Map 的地方**（Grafana 的 trace 视图 tags 列）用下面这段拍平，key 保持带点的原样，值转成
+  字符串，支持四层以内的路径：
+
+  ```sql
+  mapFromArrays(JSONAllPaths(span_attributes), arrayMap(p -> (
+      splitByChar('.', p) AS k, toJSONString(span_attributes) AS s,
+      multiIf(length(k) = 1, JSONExtractRaw(s, k[1]),
+              length(k) = 2, JSONExtractRaw(s, k[1], k[2]),
+              length(k) = 3, JSONExtractRaw(s, k[1], k[2], k[3]),
+              JSONExtractRaw(s, k[1], k[2], k[3], k[4])) AS raw,
+      if(startsWith(raw, '"'), JSONExtractString(raw), raw)).4, JSONAllPaths(span_attributes))) AS tags
+  ```
+
+**从 v0.1 的 Map 表迁过来**：`ADD COLUMN IF NOT EXISTS` 见列名已存在会跳过，`--ddl` 补不了类型，
+启动时 healthcheck 会点名哪几列还是 Map。首选直接 `DROP TABLE logs.otel_trace`（集群模式连
+`otel_trace_local` 一起，都带 `ON CLUSTER`）再重跑 `--ddl`：trace 是 30 天 TTL 的运维数据，老表里
+的东西一个月后本来就没了，为它多养一套 Map 写法的查询和面板不值。切换期间 collector 还在双写
+Jaeger 的话，那边也还能查。确实要留老数据就 `RENAME TABLE logs.otel_trace TO logs.otel_trace_v1`
+再建新表，老表按老写法查到过期。不建议 `MODIFY COLUMN ... JSON` 原地转：重写整列的 mutation
+线上风险最大，转完值还是字符串，类型的好处也没拿到。
 
 **时间戳一律带偏移写入**（`2026-09-07 11:04:08.914293456+08:00`）：span 的时间本来就是绝对时刻，
 存进去的时刻不依赖列有没有标时区。`sink.timezone` 只影响 `--ddl` 建出来的列类型（`DateTime64(9,
@@ -170,21 +223,17 @@ CREATE TABLE IF NOT EXISTS `logs`.`otel_trace`
     `status_message`      String,
     `scope_name`          LowCardinality(String),
     `scope_version`       LowCardinality(String),
-    `resource_attributes` Map(LowCardinality(String), String),
-    `span_attributes`     Map(LowCardinality(String), String),
+    `resource_attributes` JSON,
+    `span_attributes`     JSON,
     `events.timestamp`    Array(DateTime64(9, 'Asia/Shanghai')),
     `events.name`         Array(LowCardinality(String)),
-    `events.attributes`   Array(Map(LowCardinality(String), String)),
+    `events.attributes`   Array(JSON),
     `links.trace_id`      Array(String),
     `links.span_id`       Array(String),
     `links.trace_state`   Array(String),
-    `links.attributes`    Array(Map(LowCardinality(String), String)),
+    `links.attributes`    Array(JSON),
     `cluster`             LowCardinality(String),
     INDEX `idx_trace_id` `trace_id` TYPE bloom_filter GRANULARITY 4,
-    INDEX `idx_res_attr_key` mapKeys(`resource_attributes`) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX `idx_res_attr_value` mapValues(`resource_attributes`) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX `idx_span_attr_key` mapKeys(`span_attributes`) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX `idx_span_attr_value` mapValues(`span_attributes`) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX `idx_duration` `duration_ns` TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree
@@ -240,9 +289,16 @@ where service_name = 'order-service' and span_name = 'GET /orders/{id}'
   and timestamp > now() - interval 1 hour
 order by duration_ns desc limit 20;
 
--- 带某个 tag 的 span（走 idx_span_attr_key / value）
-select * from logs.otel_trace
-where span_attributes['http.response.status_code'] = '500' and timestamp > now() - interval 1 hour;
+-- 带某个 tag 的 span：JSON 列按路径取子列，只读这一个 key；类型不统一的 key 带 .:类型 取
+select timestamp, trace_id, span_attributes.http.route
+from logs.otel_trace
+where span_attributes.http.response.status_code.:Int64 = 500 and timestamp > now() - interval 1 hour;
+
+-- 某个服务出现过哪些属性 key（不解值，只读路径）
+select arrayJoin(JSONAllPaths(span_attributes)) as k, count()
+from logs.otel_trace
+where service_name = 'order-service' and timestamp > now() - interval 1 hour
+group by k order by count() desc;
 
 -- trace 关联日志（logpipe 的表）
 select timestamp, level, logger, message
@@ -253,13 +309,14 @@ order by timestamp;
 
 ### 接 Grafana
 
-ClickHouse 数据源自带 trace 视图，query 的列名对上就行：
+ClickHouse 数据源自带 trace 视图，query 的列名对上就行。tags 要 Map，用上面「属性列」里的拍平
+表达式（新版插件能直接认 JSON 列并在前端拍平，那就把 `span_attributes` 原样给它）：
 
 ```sql
 select trace_id as traceID, span_id as spanID, parent_span_id as parentSpanID,
        service_name as serviceName, span_name as operationName,
        timestamp as startTime, duration_ns / 1e6 as duration,
-       span_attributes as tags, resource_attributes as serviceTags
+       <拍平表达式 span_attributes> as tags, <拍平表达式 resource_attributes> as serviceTags
 from logs.otel_trace
 where trace_id = '${traceId}'
 order by timestamp
@@ -311,7 +368,7 @@ Job 里 `apply-ddl` 容器的 `CH_HOST` / `CH_DATABASE` / `CH_CLUSTER` / `CH_USE
 ```bash
 kubectl -n tracing get cm tracepipe-config -o jsonpath='{.data.tracepipe\.yaml}' > /tmp/tracepipe.yaml
 docker run --rm -v /tmp/tracepipe.yaml:/etc/tracepipe/tracepipe.yaml:ro \
-  ghcr.io/easayliu/trace:v0.1.1 --ddl /etc/tracepipe/tracepipe.yaml
+  ghcr.io/easayliu/trace:v0.2.0 --ddl /etc/tracepipe/tracepipe.yaml
 ```
 
 要点：多副本各自小批量写，`async_insert: true` 让 ClickHouse 服务端再攒一层；
@@ -325,15 +382,15 @@ Service 前面走 gRPC 的话注意 k8s Service 是按连接负载均衡的，�
 
 ```bash
 # 1. 先改 Cargo.toml 的 version，CI 会校验它和 tag 一致
-git commit -am "release v0.1.1"
+git commit -am "release v0.2.0"
 git push origin main
 
 # 2. tag 单独推，不能和分支挤在同一条 git push 里，否则不触发构建
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
-产出 `ghcr.io/easayliu/trace:v0.1.1`，同时把 `:latest` 指过去。`.github/workflows/ci.yml` 在
+产出 `ghcr.io/easayliu/trace:v0.2.0`，同时把 `:latest` 指过去。`.github/workflows/ci.yml` 在
 push / PR 上跑 `fmt --check` + `clippy -D warnings` + `cargo test`；`docker.yml` 构建前复用它
 作为闸门。
 

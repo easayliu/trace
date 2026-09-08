@@ -279,13 +279,15 @@ fn percent_decode(raw: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-const ALL_COLUMNS: &str = "timestamp\ntrace_id\nspan_id\nparent_span_id\ntrace_state\nspan_name\nspan_kind\nservice_name\nduration_ns\nstatus_code\nstatus_message\nscope_name\nscope_version\nresource_attributes\nspan_attributes\nevents.timestamp\nevents.name\nevents.attributes\nlinks.trace_id\nlinks.span_id\nlinks.trace_state\nlinks.attributes\n";
+/// `SELECT name, type FROM system.columns ... FORMAT TSV` 的应答。
+const ALL_COLUMNS: &str = "timestamp\tDateTime64(9)\ntrace_id\tString\nspan_id\tString\nparent_span_id\tString\ntrace_state\tString\nspan_name\tLowCardinality(String)\nspan_kind\tLowCardinality(String)\nservice_name\tLowCardinality(String)\nduration_ns\tUInt64\nstatus_code\tLowCardinality(String)\nstatus_message\tString\nscope_name\tLowCardinality(String)\nscope_version\tLowCardinality(String)\nresource_attributes\tJSON\nspan_attributes\tJSON(max_dynamic_paths=2048)\nevents.timestamp\tArray(DateTime64(9))\nevents.name\tArray(LowCardinality(String))\nevents.attributes\tArray(JSON)\nlinks.trace_id\tArray(String)\nlinks.span_id\tArray(String)\nlinks.trace_state\tArray(String)\nlinks.attributes\tArray(JSON)\n";
 
 /// 表存在但列没跟上配置：healthcheck 必须把缺的列点出来（Nested 的子列也算）。
 #[tokio::test]
 async fn healthcheck_reports_missing_columns() {
-    let without_events_ts = ALL_COLUMNS.replace("events.timestamp\n", "");
-    let columns: &'static str = Box::leak(format!("{without_events_ts}cluster\n").into_boxed_str());
+    let without_events_ts = ALL_COLUMNS.replace("events.timestamp\tArray(DateTime64(9))\n", "");
+    let columns: &'static str =
+        Box::leak(format!("{without_events_ts}cluster\tLowCardinality(String)\n").into_boxed_str());
     let (endpoint, server) = serve_sequence(vec!["1\n", "1\n", columns]).await;
     let sink = ClickhouseSink::new(endpoint, "logs", "otel_trace")
         .timeout(Duration::from_secs(5))
@@ -312,8 +314,9 @@ async fn healthcheck_reports_missing_columns() {
 
 #[tokio::test]
 async fn healthcheck_passes_when_columns_present() {
-    let columns: &'static str =
-        Box::leak(format!("{ALL_COLUMNS}env\nextra_col\n").into_boxed_str());
+    let columns: &'static str = Box::leak(
+        format!("{ALL_COLUMNS}env\tLowCardinality(String)\nextra_col\tString\n").into_boxed_str(),
+    );
     let (endpoint, server) = serve_sequence(vec!["1\n", "1\n", columns]).await;
     let sink = ClickhouseSink::new(endpoint, "logs", "otel_trace")
         .timeout(Duration::from_secs(5))
@@ -324,6 +327,40 @@ async fn healthcheck_passes_when_columns_present() {
 
     sink.healthcheck().await.expect("列齐了不该报错");
     assert_eq!(server.await.unwrap().len(), 3);
+}
+
+/// v0.1 建的表属性列是 Map：列名都在，healthcheck 也要拦下来，并说明怎么迁。
+#[tokio::test]
+async fn healthcheck_rejects_map_typed_attribute_columns() {
+    let columns: &'static str = Box::leak(
+        ALL_COLUMNS
+            .replace(
+                "span_attributes\tJSON(max_dynamic_paths=2048)",
+                "span_attributes\tMap(LowCardinality(String), String)",
+            )
+            .replace(
+                "events.attributes\tArray(JSON)",
+                "events.attributes\tArray(Map(LowCardinality(String), String))",
+            )
+            .into_boxed_str(),
+    );
+    let (endpoint, _server) = serve_sequence(vec!["1\n", "1\n", columns]).await;
+    let sink = ClickhouseSink::new(endpoint, "logs", "otel_trace").timeout(Duration::from_secs(5));
+    let err = sink.healthcheck().await.expect_err("Map 列应当报错");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("span_attributes 是 Map(LowCardinality(String), String)"),
+        "{msg}"
+    );
+    assert!(msg.contains("events.attributes 是 Array(Map"), "{msg}");
+    assert!(
+        !msg.contains("resource_attributes"),
+        "JSON 的列别点名: {msg}"
+    );
+    assert!(
+        msg.contains("DROP") && msg.contains("--ddl"),
+        "要告诉人怎么迁: {msg}"
+    );
 }
 
 #[tokio::test]
