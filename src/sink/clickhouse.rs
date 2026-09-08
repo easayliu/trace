@@ -239,11 +239,14 @@ impl ClickhouseSink {
              TTL toDateTime(`timestamp`) + INTERVAL 30 DAY";
         let db = &self.database;
         let table = &self.table;
+        // 老表补时区只补 `events.timestamp`。`timestamp` 在排序键和分区键里，ClickHouse
+        // 不允许 ALTER 键列（ALTER_OF_COLUMN_IS_FORBIDDEN），改时区也不行 —— 建表时没配
+        // timezone 的老表，这一列就只能保持裸 DateTime64(9)。存的时刻不受影响（INSERT
+        // 一律带偏移），只是查出来按服务端时区显示，要换显示时区只能重建表。
         let modify_timestamps: Vec<String> = match self.timezone {
-            Some(_) => vec![
-                format!("MODIFY COLUMN `timestamp` {timestamp_type}"),
-                format!("MODIFY COLUMN `events.timestamp` Array({timestamp_type})"),
-            ],
+            Some(_) => vec![format!(
+                "MODIFY COLUMN `events.timestamp` Array({timestamp_type})"
+            )],
             None => Vec::new(),
         };
 
@@ -519,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn timezone_changes_both_timestamp_columns() {
+    fn timezone_goes_into_create_but_only_events_timestamp_in_alter() {
         let sink = ClickhouseSink::new("http://127.0.0.1:8123", "logs", "otel_trace")
             .timezone(chrono_tz::Asia::Shanghai);
         let ddl = sink.create_table_ddl();
@@ -532,12 +535,13 @@ mod tests {
             "{ddl}"
         );
         assert!(
-            ddl.contains("MODIFY COLUMN `timestamp` DateTime64(9, 'Asia/Shanghai')"),
-            "{ddl}"
-        );
-        assert!(
             ddl.contains("MODIFY COLUMN `events.timestamp` Array(DateTime64(9, 'Asia/Shanghai'))"),
             "{ddl}"
+        );
+        // timestamp 是键列，ALTER 会被 ClickHouse 拒绝（ALTER_OF_COLUMN_IS_FORBIDDEN）
+        assert!(
+            !ddl.contains("MODIFY COLUMN `timestamp`"),
+            "键列不能 MODIFY，整条 ALTER 都会失败: {ddl}"
         );
     }
 

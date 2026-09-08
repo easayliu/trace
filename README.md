@@ -197,12 +197,17 @@ ALTER TABLE `logs`.`otel_trace`
     ...
     ADD INDEX IF NOT EXISTS `idx_trace_id` `trace_id` TYPE bloom_filter GRANULARITY 4,
     ...
-    MODIFY COLUMN `timestamp` DateTime64(9, 'Asia/Shanghai'),
     MODIFY COLUMN `events.timestamp` Array(DateTime64(9, 'Asia/Shanghai'));
 ```
 
 两段：`CREATE TABLE IF NOT EXISTS` 管新表，后面的 `ALTER TABLE` 管老表 —— 全是 `IF NOT EXISTS`
 这类幂等操作，新表上跑是空转，老表上跑就把差异补齐。所以**表结构变了重跑一遍就行**。
+
+唯一补不了的是 `timestamp` 列的时区：它在排序键和分区键里，ClickHouse 不允许 ALTER 键列
+（`ALTER_OF_COLUMN_IS_FORBIDDEN`），所以 ALTER 段只 MODIFY `events.timestamp`。建表时没配
+`timezone` 的老表，`timestamp` 就一直是裸 `DateTime64(9)`：存的时刻不受影响（INSERT 一律带
+偏移），只是查出来按服务端时区显示。要换显示时区只能重建表，或者查询时 `toTimeZone(timestamp,
+'Asia/Shanghai')`。
 
 要点：
 
@@ -306,7 +311,7 @@ Job 里 `apply-ddl` 容器的 `CH_HOST` / `CH_DATABASE` / `CH_CLUSTER` / `CH_USE
 ```bash
 kubectl -n tracing get cm tracepipe-config -o jsonpath='{.data.tracepipe\.yaml}' > /tmp/tracepipe.yaml
 docker run --rm -v /tmp/tracepipe.yaml:/etc/tracepipe/tracepipe.yaml:ro \
-  ghcr.io/easayliu/trace:v0.1.0 --ddl /etc/tracepipe/tracepipe.yaml
+  ghcr.io/easayliu/trace:v0.1.1 --ddl /etc/tracepipe/tracepipe.yaml
 ```
 
 要点：多副本各自小批量写，`async_insert: true` 让 ClickHouse 服务端再攒一层；
@@ -320,15 +325,15 @@ Service 前面走 gRPC 的话注意 k8s Service 是按连接负载均衡的，�
 
 ```bash
 # 1. 先改 Cargo.toml 的 version，CI 会校验它和 tag 一致
-git commit -am "release v0.1.0"
+git commit -am "release v0.1.1"
 git push origin main
 
 # 2. tag 单独推，不能和分支挤在同一条 git push 里，否则不触发构建
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
-产出 `ghcr.io/easayliu/trace:v0.1.0`，同时把 `:latest` 指过去。`.github/workflows/ci.yml` 在
+产出 `ghcr.io/easayliu/trace:v0.1.1`，同时把 `:latest` 指过去。`.github/workflows/ci.yml` 在
 push / PR 上跑 `fmt --check` + `clippy -D warnings` + `cargo test`；`docker.yml` 构建前复用它
 作为闸门。
 
