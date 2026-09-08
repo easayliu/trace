@@ -1,0 +1,62 @@
+# tracepipe 配置示例：收 OTLP trace 写入 ClickHouse。
+# 启动: tracepipe tracepipe.yaml    建表: tracepipe --ddl tracepipe.yaml
+
+source:
+  # otlp = 正经部署用；stdin = 读 OTLP/JSON 行（OTel collector file exporter 的格式），调试用
+  type: otlp
+  # 两个监听地址都是 OTel SDK 的默认端口。写 null 或 "" 关掉其中一个
+  grpc: 0.0.0.0:4317
+  http: 0.0.0.0:4318
+  # 单个请求（解压后）的大小上限，超过直接拒收
+  max_request_bytes: 16777216
+  # 下游队列满时最多等多久再回「稍后重试」（gRPC UNAVAILABLE / HTTP 503），SDK 会退避重发
+  enqueue_timeout_secs: 5
+  # 等数据真正写进 ClickHouse 再给 SDK 回成功：写失败 SDK 会重发，等于没有磁盘缓冲也
+  # 至少一次。代价是每个导出请求多等一个攒批周期 + 一次写入。默认关
+  wait_for_write: false
+
+# sink 的字段跟着 type 走，两段二选一（注意别混着填）
+sink:
+  type: console
+  encoding: json           # json = 和落库一致的一行 JSON；text = 一行一个 span 的摘要
+
+# 要入库就把上面两行注掉，改用这段：
+# sink:
+#   type: clickhouse
+#   endpoint: http://127.0.0.1:8123
+#   database: logs
+#   table: otel_trace
+#   # ClickHouse 集群名（system.clusters 里的那个）。填了 --ddl 就生成
+#   # ReplicatedMergeTree 本地表 otel_trace_local + Distributed 表 otel_trace，
+#   # 两条都带 ON CLUSTER；sink 还是往 table 写，写入路径不变。单机不用填。
+#   cluster: ""
+#   # 时间戳列的显示时区。只影响 --ddl：timestamp / events.timestamp 建成
+#   # DateTime64(9, 'Asia/Shanghai')。存的时刻总是对的（INSERT 一律带偏移），
+#   # 配上是为了和 logpipe 的日志表查出来是同一个口径的时间。
+#   timezone: Asia/Shanghai
+#   user: default
+#   password: ""
+#   async_insert: false    # 打开后由 ClickHouse 服务端再攒一层批，多副本时建议开
+#   timeout_secs: 30
+
+batch:
+  max_events: 20000
+  max_bytes: 8388608
+  timeout_secs: 2
+
+retry:
+  max_attempts: 5
+  initial_backoff_ms: 500
+  max_backoff_secs: 30
+
+pipeline:
+  buffer: 64
+  # ClickHouse 连不上就不启动
+  require_healthy: true
+  # 重试耗尽后：stop = 停下（配了 wait_for_write 的话 SDK 会重发）；drop = 丢掉继续跑
+  on_error: stop
+
+# 附加到每条 span 上的静态字段（--ddl 会自动带上对应的列）
+fields:
+  cluster: bj-prod
+  env: prod
